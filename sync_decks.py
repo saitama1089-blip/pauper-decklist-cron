@@ -1,7 +1,7 @@
 import requests
 import os
 import sys
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional
 from datetime import datetime
 import time
 
@@ -22,8 +22,7 @@ DECK_CACHE_TABLE = "deck_cache_view"
 BATCH_SIZE = 1000
 RATE_LIMIT_DELAY = 0.5
 
-# GitHub Actions runs for max 6 hours, but we'll set a conservative limit
-# Process max 100 decks per run (adjustable based on your needs)
+# Process max 100 decks per run (adjustable)
 MAX_DECKS_PER_RUN = int(os.environ.get("MAX_DECKS_PER_RUN", "100"))
 
 
@@ -38,73 +37,83 @@ def log(message: str, level: str = "INFO"):
 
 
 # ------------------------------
-# Helper: Supabase GET with pagination
+# Find missing IDs using SQL NOT IN query
 # ------------------------------
-def supabase_get_paginated(path: str, select: str) -> List[dict]:
-    """Fetch all rows from a table, handling pagination automatically."""
-    all_rows = []
-    offset = 0
-    
-    while True:
-        url = f"{SUPABASE_URL}{path}"
-        headers = {
-            "apikey": SUPABASE_ANON_KEY,
-            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        }
-        params = {
-            "select": select,
-            "limit": BATCH_SIZE,
-            "offset": offset,
-        }
-        
-        log(f"Fetching rows {offset} to {offset + BATCH_SIZE}...")
-        r = requests.get(url, headers=headers, params=params, timeout=20)
-        
-        if r.status_code != 200:
-            raise RuntimeError(f"Supabase GET error {r.status_code}: {r.text}")
-        
-        batch = r.json()
-        if not batch:
-            break
-            
-        all_rows.extend(batch)
-        
-        if len(batch) < BATCH_SIZE:
-            break
-            
-        offset += BATCH_SIZE
-        time.sleep(RATE_LIMIT_DELAY)
-    
-    return all_rows
-
-
-# ------------------------------
-# Read IDs from both tables
-# ------------------------------
-def get_ids_from_supabase() -> Tuple[Set[int], Set[int]]:
+def get_missing_ids(limit: int = MAX_DECKS_PER_RUN) -> List[int]:
     """
-    Returns:
-      (results_ids, cache_ids)
+    Use a single SQL query to find IDs in pauper_league_results
+    that are NOT in deck_cache_view.
+    This is much more efficient than fetching both tables.
     """
-    log("Fetching all IDs from pauper_league_results...")
-    results_rows = supabase_get_paginated(
-        f"/rest/v1/{RESULTS_TABLE}",
-        "id"
-    )
-    results_ids: Set[int] = {int(row["id"]) for row in results_rows if "id" in row}
-    log(f"Found {len(results_ids)} IDs in results table")
-
-    log("Fetching all deck_ids from deck_cache_view...")
-    cache_rows = supabase_get_paginated(
-        f"/rest/v1/{DECK_CACHE_TABLE}",
-        "deck_id"
-    )
-    cache_ids: Set[int] = {
-        int(row["deck_id"]) for row in cache_rows if "deck_id" in row
+    url = f"{SUPABASE_URL}/rest/v1/rpc/get_missing_deck_ids"
+    
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
     }
-    log(f"Found {len(cache_ids)} IDs in cache table")
+    
+    payload = {"max_results": limit}
+    
+    try:
+        log(f"Fetching up to {limit} missing deck IDs using SQL query...")
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
+        
+        if r.status_code == 200:
+            result = r.json()
+            missing_ids = [int(row["id"]) for row in result] if isinstance(result, list) else []
+            log(f"Found {len(missing_ids)} missing deck IDs")
+            return missing_ids
+        else:
+            log(f"RPC call failed with status {r.status_code}: {r.text}", "ERROR")
+            log("Falling back to traditional method...", "WARNING")
+            return get_missing_ids_fallback(limit)
+            
+    except Exception as e:
+        log(f"Error calling RPC function: {e}", "ERROR")
+        log("Falling back to traditional method...", "WARNING")
+        return get_missing_ids_fallback(limit)
 
-    return results_ids, cache_ids
+
+# ------------------------------
+# Fallback: Traditional method using LEFT JOIN
+# ------------------------------
+def get_missing_ids_fallback(limit: int = MAX_DECKS_PER_RUN) -> List[int]:
+    """
+    Fallback method: Use LEFT JOIN to find missing IDs.
+    Still more efficient than fetching both full tables.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{RESULTS_TABLE}"
+    
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+    }
+    
+    # Use Supabase's query syntax with left join
+    params = {
+        "select": f"id,{DECK_CACHE_TABLE}!left(deck_id)",
+        "limit": limit,
+        f"{DECK_CACHE_TABLE}.deck_id": "is.null",
+        "order": "id.asc"
+    }
+    
+    try:
+        log(f"Fetching up to {limit} missing deck IDs using LEFT JOIN...")
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        
+        if r.status_code == 200:
+            rows = r.json()
+            missing_ids = [int(row["id"]) for row in rows if row.get("id")]
+            log(f"Found {len(missing_ids)} missing deck IDs")
+            return missing_ids
+        else:
+            log(f"Query failed with status {r.status_code}: {r.text}", "ERROR")
+            raise RuntimeError(f"Failed to fetch missing IDs: {r.text}")
+            
+    except Exception as e:
+        log(f"Error in fallback method: {e}", "ERROR")
+        raise
 
 
 # ----------------------------------------
@@ -205,27 +214,18 @@ def sync_missing_decks() -> int:
         log("DECK SYNC STARTING")
         log("=" * 60)
         
-        # Get all IDs from both tables
-        results_ids, cache_ids = get_ids_from_supabase()
-
-        # Find missing IDs
-        missing_ids = sorted(results_ids - cache_ids)
+        # Get missing IDs using efficient SQL query
+        missing_ids = get_missing_ids(limit=MAX_DECKS_PER_RUN)
         
         log("=" * 60)
         log("SYNC ANALYSIS")
         log("=" * 60)
-        log(f"Total IDs in {RESULTS_TABLE}: {len(results_ids)}")
-        log(f"Total IDs in {DECK_CACHE_TABLE}: {len(cache_ids)}")
         log(f"Missing in cache: {len(missing_ids)}")
+        log(f"Will process: {min(len(missing_ids), MAX_DECKS_PER_RUN)} decks this run")
 
         if not missing_ids:
             log("No missing decks to import. Cache is up to date!")
             return 0
-
-        # Limit decks per run for GitHub Actions
-        if len(missing_ids) > MAX_DECKS_PER_RUN:
-            log(f"Limiting to first {MAX_DECKS_PER_RUN} decks (out of {len(missing_ids)} total)", "WARNING")
-            missing_ids = missing_ids[:MAX_DECKS_PER_RUN]
 
         # Process decks
         log("=" * 60)
