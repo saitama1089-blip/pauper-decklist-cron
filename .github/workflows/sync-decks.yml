@@ -32,7 +32,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install -r requirements.txt
       
       - name: Run deck sync
         env:
@@ -40,11 +40,3 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
           python sync_decks.py
-      
-      - name: Upload sync log (optional)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sync-log-${{ github.run_number }}
-          path: sync_log.txt
-          retention-days: 7
