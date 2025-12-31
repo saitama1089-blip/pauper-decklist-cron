@@ -399,6 +399,9 @@ def sync_missing_decks() -> int:
         total_stats = {"success": 0, "failed": 0, "skipped": 0}
         batch_num = 0
 
+        # NEW: track if there was any work to do
+        saw_missing_any = False
+
         while True:
             batch_num += 1
 
@@ -413,6 +416,9 @@ def sync_missing_decks() -> int:
             if not missing_ids:
                 log("No missing decks to import. Cache is up to date!")
                 break
+
+            # NEW: we found work to do
+            saw_missing_any = True
 
             log("=" * 60)
             log(f"PROCESSING {len(missing_ids)} DECKS (BATCH {batch_num})")
@@ -452,6 +458,12 @@ def sync_missing_decks() -> int:
         log(f"Skipped: {total_stats['skipped']}")
         log("=" * 60)
 
+        # ✅ FIXED EXIT CODES:
+        # - If there was nothing to do => success
+        # - If there was work and at least one success => success
+        # - If there was work but zero successes => failure
+        if not saw_missing_any:
+            return 0
         return 0 if total_stats["success"] > 0 else 1
 
     except Exception as e:
