@@ -6,6 +6,7 @@ import unicodedata
 import time
 from typing import List, Dict, Optional
 from datetime import datetime
+from urllib.parse import quote_plus
 
 # ==========================
 # Configuration from environment variables (NO HARDCODED SECRETS!)
@@ -46,11 +47,28 @@ def normalize_card_name(name: str) -> str:
     if not name:
         return ""
 
-    name = unicodedata.normalize('NFKC', name)
-    name = name.replace(''', "'").replace(''', "'")
-    name = name.replace('"', '"').replace('"', '"')
+    name = unicodedata.normalize("NFKC", name)
 
-    return name
+    # Curly apostrophes / quotes → plain
+    name = name.replace("\u2019", "'").replace("\u2018", "'")
+    name = name.replace("\u201C", '"').replace("\u201D", '"')
+
+    return name.strip()
+
+
+# ------------------------------
+# Build Scryfall "named image" URL (no API call needed)
+# ------------------------------
+def build_scryfall_fuzzy_image_url(card_name: str, version: str = "normal") -> str:
+    """
+    Returns a deterministic URL that Scryfall will redirect to the CDN image.
+    Example:
+      https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=lorien+revealed
+    """
+    name = normalize_card_name(card_name)
+    if not name:
+        return ""
+    return f"https://api.scryfall.com/cards/named?format=image&version={version}&fuzzy={quote_plus(name)}"
 
 
 # ------------------------------
@@ -61,7 +79,7 @@ def parse_decklist(decklist: str) -> Dict[str, List[Dict[str, any]]]:
     Parse a decklist string into mainboard and sideboard sections.
     Sections are separated by a blank line.
     """
-    lines = decklist.strip().split('\n')
+    lines = decklist.strip().split("\n")
 
     mainboard = []
     sideboard = []
@@ -77,7 +95,7 @@ def parse_decklist(decklist: str) -> Dict[str, List[Dict[str, any]]]:
                 current_section = sideboard
             continue
 
-        match = re.match(r'^(\d+)\s+(.+)$', line)
+        match = re.match(r"^(\d+)\s+(.+)$", line)
         if match:
             count = int(match.group(1))
             card_name = match.group(2).strip()
@@ -86,142 +104,40 @@ def parse_decklist(decklist: str) -> Dict[str, List[Dict[str, any]]]:
             card_name = line.strip()
 
         if card_name:
-            current_section.append({
-                'name': card_name,
-                'count': count
-            })
+            current_section.append({"name": card_name, "count": count})
 
-    return {
-        'mainboard': mainboard,
-        'sideboard': sideboard
-    }
+    return {"mainboard": mainboard, "sideboard": sideboard}
 
 
 # ------------------------------
-# Fetch card data from Scryfall
-# ------------------------------
-def fetch_cards_from_scryfall(card_names: List[str], chunk_size: int = 75) -> Dict[str, Dict]:
-    """Fetch card data from Scryfall's collection endpoint in batches."""
-    card_data_by_name = {}
-    unique_names = list(set(card_names))
-
-    for i in range(0, len(unique_names), chunk_size):
-        chunk = unique_names[i:i + chunk_size]
-        identifiers = [{'name': name} for name in chunk]
-
-        try:
-            response = requests.post(
-                'https://api.scryfall.com/cards/collection',
-                json={'identifiers': identifiers},
-                headers={'Content-Type': 'application/json'},
-                timeout=10
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                cards = data.get('data', [])
-
-                for card in cards:
-                    if not card:
-                        continue
-
-                    if 'card_faces' in card and card['card_faces']:
-                        for idx, face in enumerate(card['card_faces']):
-                            if face and 'name' in face:
-                                key = normalize_card_name(face['name']).lower()
-                                card_data_by_name[key] = {
-                                    'card': card,
-                                    'face_index': idx
-                                }
-                    else:
-                        if 'name' in card:
-                            key = normalize_card_name(card['name']).lower()
-                            card_data_by_name[key] = {
-                                'card': card,
-                                'face_index': None
-                            }
-            else:
-                log(f"Scryfall API returned status {response.status_code}", "WARNING")
-
-        except Exception as e:
-            log(f"Error fetching chunk from Scryfall: {e}", "WARNING")
-
-        # Rate limiting for Scryfall API
-        if i + chunk_size < len(unique_names):
-            time.sleep(0.1)
-
-    return card_data_by_name
-
-
-# ------------------------------
-# Get card image URL
-# ------------------------------
-def get_card_image_url(card_data: Dict, face_index: Optional[int] = None) -> str:
-    """Extract the normal/large image URL from card data."""
-    card = card_data.get('card', {})
-    face_idx = card_data.get('face_index', face_index)
-
-    if face_idx is not None and 'card_faces' in card:
-        faces = card['card_faces']
-        if face_idx < len(faces) and 'image_uris' in faces[face_idx]:
-            image_uris = faces[face_idx]['image_uris']
-            return image_uris.get('normal') or image_uris.get('large') or image_uris.get('small', '')
-
-    if 'image_uris' in card:
-        image_uris = card['image_uris']
-        return image_uris.get('normal') or image_uris.get('large') or image_uris.get('small', '')
-
-    if 'card_faces' in card and card['card_faces']:
-        first_face = card['card_faces'][0]
-        if 'image_uris' in first_face:
-            image_uris = first_face['image_uris']
-            return image_uris.get('normal') or image_uris.get('large') or image_uris.get('small', '')
-
-    return ''
-
-
-# ------------------------------
-# Process decklist into JSON with Scryfall data
+# Process decklist into JSON (no Scryfall fetching)
 # ------------------------------
 def process_decklist_to_json(decklist: str) -> Dict:
     """
-    Process a decklist string and return formatted JSON with Scryfall URLs.
+    Process a decklist string and return formatted JSON with Scryfall image URLs
+    built locally via the 'named?format=image&fuzzy=' endpoint.
     """
     parsed = parse_decklist(decklist)
 
-    all_card_names = []
-    for card in parsed['mainboard']:
-        all_card_names.append(normalize_card_name(card['name']))
-    for card in parsed['sideboard']:
-        all_card_names.append(normalize_card_name(card['name']))
+    result = {"mainboard": [], "sideboard": []}
 
-    log(f"Fetching {len(set(all_card_names))} unique cards from Scryfall...")
-    card_data = fetch_cards_from_scryfall(all_card_names)
+    for card in parsed["mainboard"]:
+        result["mainboard"].append(
+            {
+                "name": card["name"],
+                "count": card["count"],
+                "scryfall_url": build_scryfall_fuzzy_image_url(card["name"]),
+            }
+        )
 
-    result = {
-        'mainboard': [],
-        'sideboard': []
-    }
-
-    for card in parsed['mainboard']:
-        normalized_name = normalize_card_name(card['name']).lower()
-        card_info = card_data.get(normalized_name)
-
-        result['mainboard'].append({
-            'name': card['name'],
-            'count': card['count'],
-            'scryfall_url': get_card_image_url(card_info) if card_info else ''
-        })
-
-    for card in parsed['sideboard']:
-        normalized_name = normalize_card_name(card['name']).lower()
-        card_info = card_data.get(normalized_name)
-
-        result['sideboard'].append({
-            'name': card['name'],
-            'count': card['count'],
-            'scryfall_url': get_card_image_url(card_info) if card_info else ''
-        })
+    for card in parsed["sideboard"]:
+        result["sideboard"].append(
+            {
+                "name": card["name"],
+                "count": card["count"],
+                "scryfall_url": build_scryfall_fuzzy_image_url(card["name"]),
+            }
+        )
 
     return result
 
@@ -355,7 +271,7 @@ def import_decks_batch(deck_ids: List[int]) -> Dict[str, int]:
             continue
 
         try:
-            # Process decklist into JSON with Scryfall data
+            # Process decklist into JSON (no Scryfall API calls)
             json_decklist = process_decklist_to_json(text)
 
             # Save to database
@@ -364,6 +280,7 @@ def import_decks_batch(deck_ids: List[int]) -> Dict[str, int]:
                 stats["success"] += 1
             else:
                 stats["failed"] += 1
+
         except Exception as e:
             log(f"Error processing deck {deck_id}: {e}", "ERROR")
             stats["failed"] += 1
@@ -417,13 +334,11 @@ def sync_missing_decks() -> int:
             log(f"Success rate: {stats['success'] / len(missing_ids) * 100:.1f}%")
         log("=" * 60)
 
-        # Return success if we processed at least some decks successfully
         return 0 if stats["success"] > 0 or len(missing_ids) == 0 else 1
 
     except Exception as e:
         log(f"Fatal error: {e}", "ERROR")
         import traceback
-
         log(traceback.format_exc(), "ERROR")
         return 1
 
