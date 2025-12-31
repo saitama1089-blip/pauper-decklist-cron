@@ -22,11 +22,13 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE:
 
 RESULTS_TABLE = "pauper_league_results"
 DECK_CACHE_TABLE = "deck_cache_view"
-BATCH_SIZE = 1000
-RATE_LIMIT_DELAY = 0.5
+RATE_LIMIT_DELAY = float(os.environ.get("RATE_LIMIT_DELAY", "0.5"))
 
-# Process max 100 decks per run (adjustable)
-MAX_DECKS_PER_RUN = int(os.environ.get("MAX_DECKS_PER_RUN", "100"))
+# 0 means "no limit" (process everything)
+MAX_DECKS_PER_RUN = int(os.environ.get("MAX_DECKS_PER_RUN", "0"))
+
+# When processing "all", we still do it in batches for safety
+BATCH_FETCH_LIMIT = int(os.environ.get("BATCH_FETCH_LIMIT", "500"))
 
 
 # ------------------------------
@@ -145,7 +147,7 @@ def process_decklist_to_json(decklist: str) -> Dict:
 # ------------------------------
 # Find missing IDs using RPC
 # ------------------------------
-def get_missing_ids(limit: int = MAX_DECKS_PER_RUN) -> List[int]:
+def get_missing_ids(limit: int) -> List[int]:
     """
     Use the RPC function get_missing_deck_ids(max_results integer)
     to find deck IDs in pauper_league_results that are NOT in deck_cache_view.
@@ -285,17 +287,19 @@ def import_decks_batch(deck_ids: List[int]) -> Dict[str, int]:
             log(f"Error processing deck {deck_id}: {e}", "ERROR")
             stats["failed"] += 1
 
-        time.sleep(RATE_LIMIT_DELAY)
+        if RATE_LIMIT_DELAY > 0:
+            time.sleep(RATE_LIMIT_DELAY)
 
     return stats
 
 
 # ----------------------------------------------------
-# Main sync function
+# Main sync function (process ALL missing decks)
 # ----------------------------------------------------
 def sync_missing_decks() -> int:
     """
     Sync missing decks from results table to cache table.
+    Processes ALL missing decks by looping until none remain.
     Returns exit code (0 for success, 1 for failure).
     """
     try:
@@ -303,38 +307,65 @@ def sync_missing_decks() -> int:
         log("DECK SYNC STARTING (JSON MODE)")
         log("=" * 60)
 
-        # Get missing IDs using efficient RPC
-        missing_ids = get_missing_ids(limit=MAX_DECKS_PER_RUN)
+        total_stats = {"success": 0, "failed": 0, "skipped": 0}
+        batch_num = 0
+
+        while True:
+            batch_num += 1
+
+            # If MAX_DECKS_PER_RUN == 0, do it in safe chunks
+            limit = MAX_DECKS_PER_RUN if MAX_DECKS_PER_RUN > 0 else BATCH_FETCH_LIMIT
+
+            missing_ids = get_missing_ids(limit=limit)
+
+            log("=" * 60)
+            log(f"BATCH {batch_num} ANALYSIS")
+            log("=" * 60)
+            log(f"Missing in cache (this batch): {len(missing_ids)}")
+
+            if not missing_ids:
+                log("No missing decks to import. Cache is up to date!")
+                break
+
+            log("=" * 60)
+            log(f"PROCESSING {len(missing_ids)} DECKS (BATCH {batch_num})")
+            log("=" * 60)
+
+            stats = import_decks_batch(missing_ids)
+
+            total_stats["success"] += stats["success"]
+            total_stats["failed"] += stats["failed"]
+            total_stats["skipped"] += stats["skipped"]
+
+            log("=" * 60)
+            log(f"BATCH {batch_num} SUMMARY")
+            log("=" * 60)
+            log(f"Imported: {stats['success']}")
+            log(f"Failed: {stats['failed']}")
+            log(f"Skipped: {stats['skipped']}")
+
+            # If we failed all of them, continuing could loop forever (same IDs keep returning)
+            if stats["success"] == 0 and stats["failed"] > 0 and MAX_DECKS_PER_RUN == 0:
+                log(
+                    "No successes in this batch while processing ALL decks; stopping to avoid infinite loop. "
+                    "Fix the underlying failures and rerun.",
+                    "WARNING",
+                )
+                break
+
+            # Be polite between batches
+            time.sleep(1.0)
 
         log("=" * 60)
-        log("SYNC ANALYSIS")
+        log("FINAL SUMMARY (ALL BATCHES)")
         log("=" * 60)
-        log(f"Missing in cache: {len(missing_ids)}")
-        log(f"Will process: {min(len(missing_ids), MAX_DECKS_PER_RUN)} decks this run")
-
-        if not missing_ids:
-            log("No missing decks to import. Cache is up to date!")
-            return 0
-
-        # Process decks
-        log("=" * 60)
-        log(f"PROCESSING {len(missing_ids)} DECKS")
+        log(f"Successfully imported: {total_stats['success']}")
+        log(f"Failed to import: {total_stats['failed']}")
+        log(f"Skipped: {total_stats['skipped']}")
         log("=" * 60)
 
-        stats = import_decks_batch(missing_ids)
-
-        # Final summary
-        log("=" * 60)
-        log("FINAL SUMMARY")
-        log("=" * 60)
-        log(f"Successfully imported: {stats['success']}")
-        log(f"Failed to import: {stats['failed']}")
-        log(f"Total processed: {len(missing_ids)}")
-        if len(missing_ids) > 0:
-            log(f"Success rate: {stats['success'] / len(missing_ids) * 100:.1f}%")
-        log("=" * 60)
-
-        return 0 if stats["success"] > 0 or len(missing_ids) == 0 else 1
+        # Success if we imported at least one OR there was nothing to do
+        return 0 if total_stats["success"] > 0 else 1
 
     except Exception as e:
         log(f"Fatal error: {e}", "ERROR")
