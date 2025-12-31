@@ -4,6 +4,7 @@ import sys
 import re
 import unicodedata
 import time
+import random
 from typing import List, Dict, Optional
 from datetime import datetime
 from urllib.parse import quote_plus
@@ -22,13 +23,35 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE:
 
 RESULTS_TABLE = "pauper_league_results"
 DECK_CACHE_TABLE = "deck_cache_view"
-RATE_LIMIT_DELAY = float(os.environ.get("RATE_LIMIT_DELAY", "0.5"))
+
+# NOTE: On GitHub Actions you are more likely to be throttled by MTGGoldfish.
+# Use jitter-based delays for MTGGoldfish and keep Supabase delay minimal.
+RATE_LIMIT_DELAY = float(os.environ.get("RATE_LIMIT_DELAY", "0.0"))
 
 # 0 means "no limit" (process everything)
 MAX_DECKS_PER_RUN = int(os.environ.get("MAX_DECKS_PER_RUN", "0"))
 
 # When processing "all", we still do it in batches for safety
-BATCH_FETCH_LIMIT = int(os.environ.get("BATCH_FETCH_LIMIT", "500"))
+BATCH_FETCH_LIMIT = int(os.environ.get("BATCH_FETCH_LIMIT", "200"))
+
+# MTGGoldfish throttle/backoff tuning (recommended for GitHub Actions)
+MTGGOLDFISH_DELAY_MIN = float(os.environ.get("MTGGOLDFISH_DELAY_MIN", "3.0"))
+MTGGOLDFISH_DELAY_MAX = float(os.environ.get("MTGGOLDFISH_DELAY_MAX", "7.0"))
+MTGGOLDFISH_MAX_RETRIES = int(os.environ.get("MTGGOLDFISH_MAX_RETRIES", "7"))
+MTGGOLDFISH_TIMEOUT = int(os.environ.get("MTGGOLDFISH_TIMEOUT", "25"))
+
+# Shared session (keep-alive + cookies)
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": os.environ.get(
+        "USER_AGENT",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/plain,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+})
 
 
 # ------------------------------
@@ -39,6 +62,13 @@ def log(message: str, level: str = "INFO"):
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] [{level}] {message}")
     sys.stdout.flush()
+
+
+# ------------------------------
+# Sleep helpers (jitter)
+# ------------------------------
+def sleep_jitter(min_s: float, max_s: float):
+    time.sleep(random.uniform(min_s, max_s))
 
 
 # ------------------------------
@@ -63,9 +93,8 @@ def normalize_card_name(name: str) -> str:
 # ------------------------------
 def build_scryfall_fuzzy_image_url(card_name: str, version: str = "normal") -> str:
     """
-    Returns a deterministic URL that Scryfall will redirect to the CDN image.
-    Example:
-      https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=lorien+revealed
+    Deterministic URL that Scryfall will redirect to the CDN image.
+    Works directly in <img src="..."> because browsers follow redirects.
     """
     name = normalize_card_name(card_name)
     if not name:
@@ -116,8 +145,7 @@ def parse_decklist(decklist: str) -> Dict[str, List[Dict[str, any]]]:
 # ------------------------------
 def process_decklist_to_json(decklist: str) -> Dict:
     """
-    Process a decklist string and return formatted JSON with Scryfall image URLs
-    built locally via the 'named?format=image&fuzzy=' endpoint.
+    Return formatted JSON with Scryfall image URLs built locally.
     """
     parsed = parse_decklist(decklist)
 
@@ -149,8 +177,7 @@ def process_decklist_to_json(decklist: str) -> Dict:
 # ------------------------------
 def get_missing_ids(limit: int) -> List[int]:
     """
-    Use the RPC function get_missing_deck_ids(max_results integer)
-    to find deck IDs in pauper_league_results that are NOT in deck_cache_view.
+    Use RPC get_missing_deck_ids(max_results integer) to find missing deck IDs.
     """
     url = f"{SUPABASE_URL}/rest/v1/rpc/get_missing_deck_ids"
 
@@ -162,60 +189,125 @@ def get_missing_ids(limit: int) -> List[int]:
 
     payload = {"max_results": limit}
 
-    try:
-        log(f"Fetching up to {limit} missing deck IDs using RPC get_missing_deck_ids...")
-        r = requests.post(url, json=payload, headers=headers, timeout=30)
+    log(f"Fetching up to {limit} missing deck IDs using RPC get_missing_deck_ids...")
+    r = requests.post(url, json=payload, headers=headers, timeout=30)
 
-        if r.status_code == 200:
-            result = r.json()
+    if r.status_code != 200:
+        log(f"RPC call failed with status {r.status_code}: {r.text}", "ERROR")
+        raise RuntimeError(f"Failed to fetch missing IDs via RPC: {r.text}")
 
-            missing_ids: List[int] = []
+    result = r.json()
+    missing_ids: List[int] = []
 
-            # Handle both possible return shapes:
-            # 1) [{"deck_id": 123}, ...]
-            # 2) [123, 456, ...]
-            if isinstance(result, list) and result:
-                if isinstance(result[0], dict):
-                    for row in result:
-                        val = row.get("deck_id") or row.get("id")
-                        if val is not None:
-                            missing_ids.append(int(val))
-                else:
-                    missing_ids = [int(x) for x in result]
-            else:
-                missing_ids = []
-
-            log(f"Found {len(missing_ids)} missing deck IDs")
-            return missing_ids
-
+    # Handle both possible return shapes:
+    # 1) [{"deck_id": 123}, ...]
+    # 2) [123, 456, ...]
+    if isinstance(result, list) and result:
+        if isinstance(result[0], dict):
+            for row in result:
+                val = row.get("deck_id") or row.get("id")
+                if val is not None:
+                    missing_ids.append(int(val))
         else:
-            log(f"RPC call failed with status {r.status_code}: {r.text}", "ERROR")
-            raise RuntimeError(f"Failed to fetch missing IDs via RPC: {r.text}")
+            missing_ids = [int(x) for x in result]
 
-    except Exception as e:
-        log(f"Error calling RPC function: {e}", "ERROR")
-        raise
+    log(f"Found {len(missing_ids)} missing deck IDs")
+    return missing_ids
 
 
 # ----------------------------------------
-# Fetch raw decklist text from MTGGoldfish
+# MTGGoldfish throttle detection + backoff
+# ----------------------------------------
+def _looks_like_throttle(resp: requests.Response) -> bool:
+    if resp.status_code in (429, 403, 503):
+        return True
+    body = (resp.text or "").lower()
+    # Cloudflare/captcha pages
+    if "<html" in body and ("cloudflare" in body or "captcha" in body or "attention required" in body):
+        return True
+    # Deck download endpoint returning an HTML page is usually bad
+    if "<html" in body:
+        return True
+    return False
+
+
+def _get_with_backoff(url: str) -> Optional[requests.Response]:
+    """
+    GET with retries and exponential backoff on throttle-like responses.
+    Honors Retry-After header when present.
+    """
+    for attempt in range(1, MTGGOLDFISH_MAX_RETRIES + 1):
+        try:
+            resp = SESSION.get(url, timeout=MTGGOLDFISH_TIMEOUT)
+
+            if resp.status_code == 200 and not _looks_like_throttle(resp):
+                return resp
+
+            if _looks_like_throttle(resp):
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    wait = float(retry_after)
+                else:
+                    # exponential backoff + jitter (cap at 120s)
+                    wait = min(120.0, (2 ** (attempt - 1)) + random.uniform(1.0, 4.0))
+
+                log(
+                    f"MTGGoldfish throttle detected ({resp.status_code}). "
+                    f"Backing off {wait:.1f}s (attempt {attempt}/{MTGGOLDFISH_MAX_RETRIES})",
+                    "WARNING",
+                )
+                time.sleep(wait)
+                continue
+
+            # Other non-200 errors: small backoff
+            wait = min(30.0, attempt * 2.0 + random.uniform(0.5, 2.0))
+            log(
+                f"MTGGoldfish returned {resp.status_code}. Waiting {wait:.1f}s "
+                f"(attempt {attempt}/{MTGGOLDFISH_MAX_RETRIES})",
+                "WARNING",
+            )
+            time.sleep(wait)
+
+        except (requests.Timeout, requests.ConnectionError) as e:
+            wait = min(120.0, (2 ** (attempt - 1)) + random.uniform(1.0, 4.0))
+            log(
+                f"Network issue fetching MTGGoldfish: {e}. Waiting {wait:.1f}s "
+                f"(attempt {attempt}/{MTGGOLDFISH_MAX_RETRIES})",
+                "WARNING",
+            )
+            time.sleep(wait)
+
+    return None
+
+
+# ----------------------------------------
+# Fetch raw decklist text from MTGGoldfish (with jitter/backoff)
 # ----------------------------------------
 def fetch_deck_text(deck_id: int) -> Optional[str]:
-    """Try to fetch deck text from MTGGoldfish."""
+    """
+    Fetch deck text from MTGGoldfish.
+    On GitHub Actions, throttle is common, so we:
+      - jitter sleep BEFORE each deck fetch
+      - retry with backoff on 429/403/503/HTML pages
+      - use a shared session + headers
+    """
     endpoints = [
         f"https://www.mtggoldfish.com/deck/download/{deck_id}",
         f"https://www.mtggoldfish.com/deck/arena_download/{deck_id}",
     ]
 
+    # polite jitter before each deck to reduce bot-like cadence
+    sleep_jitter(MTGGOLDFISH_DELAY_MIN, MTGGOLDFISH_DELAY_MAX)
+
     for url in endpoints:
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                text = r.text.strip()
-                if text and "<html" not in text.lower():
-                    return text
-        except Exception as e:
-            log(f"Error fetching from {url}: {e}", "WARNING")
+        resp = _get_with_backoff(url)
+        if not resp:
+            continue
+
+        if resp.status_code == 200:
+            text = (resp.text or "").strip()
+            if text and "<html" not in text.lower():
+                return text
 
     return None
 
@@ -240,7 +332,7 @@ def save_deck_to_supabase(deck_id: int, json_decklist: Dict) -> bool:
     }
 
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        r = requests.post(url, json=payload, headers=headers, timeout=15)
 
         if r.status_code in (200, 201, 204):
             return True
@@ -265,18 +357,15 @@ def import_decks_batch(deck_ids: List[int]) -> Dict[str, int]:
     for i, deck_id in enumerate(deck_ids, 1):
         log(f"[{i}/{len(deck_ids)}] Processing deck {deck_id}...")
 
-        # Fetch raw decklist text
         text = fetch_deck_text(deck_id)
         if not text:
-            log(f"Could not fetch deck {deck_id}", "WARNING")
+            log(f"Could not fetch deck {deck_id} (likely throttled or missing)", "WARNING")
             stats["failed"] += 1
             continue
 
         try:
-            # Process decklist into JSON (no Scryfall API calls)
             json_decklist = process_decklist_to_json(text)
 
-            # Save to database
             if save_deck_to_supabase(deck_id, json_decklist):
                 log(f"Successfully saved deck {deck_id}")
                 stats["success"] += 1
@@ -287,6 +376,7 @@ def import_decks_batch(deck_ids: List[int]) -> Dict[str, int]:
             log(f"Error processing deck {deck_id}: {e}", "ERROR")
             stats["failed"] += 1
 
+        # Optional extra delay (generally keep this low; MTGGoldfish jitter does the heavy lifting)
         if RATE_LIMIT_DELAY > 0:
             time.sleep(RATE_LIMIT_DELAY)
 
@@ -300,7 +390,6 @@ def sync_missing_decks() -> int:
     """
     Sync missing decks from results table to cache table.
     Processes ALL missing decks by looping until none remain.
-    Returns exit code (0 for success, 1 for failure).
     """
     try:
         log("=" * 60)
@@ -313,9 +402,7 @@ def sync_missing_decks() -> int:
         while True:
             batch_num += 1
 
-            # If MAX_DECKS_PER_RUN == 0, do it in safe chunks
             limit = MAX_DECKS_PER_RUN if MAX_DECKS_PER_RUN > 0 else BATCH_FETCH_LIMIT
-
             missing_ids = get_missing_ids(limit=limit)
 
             log("=" * 60)
@@ -348,13 +435,14 @@ def sync_missing_decks() -> int:
             if stats["success"] == 0 and stats["failed"] > 0 and MAX_DECKS_PER_RUN == 0:
                 log(
                     "No successes in this batch while processing ALL decks; stopping to avoid infinite loop. "
-                    "Fix the underlying failures and rerun.",
+                    "This is usually MTGGoldfish throttling on GitHub Actions. "
+                    "Increase MTGGOLDFISH_DELAY_MIN/MAX or rerun later.",
                     "WARNING",
                 )
                 break
 
-            # Be polite between batches
-            time.sleep(1.0)
+            # Be polite between batches (small pause)
+            time.sleep(random.uniform(2.0, 5.0))
 
         log("=" * 60)
         log("FINAL SUMMARY (ALL BATCHES)")
@@ -364,7 +452,6 @@ def sync_missing_decks() -> int:
         log(f"Skipped: {total_stats['skipped']}")
         log("=" * 60)
 
-        # Success if we imported at least one OR there was nothing to do
         return 0 if total_stats["success"] > 0 else 1
 
     except Exception as e:
