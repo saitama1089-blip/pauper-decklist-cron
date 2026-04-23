@@ -8,6 +8,7 @@ import random
 from typing import List, Dict, Optional
 from datetime import datetime
 from urllib.parse import quote_plus
+from bs4 import BeautifulSoup
 
 # ==========================
 # Configuration from environment variables (NO HARDCODED SECRETS!)
@@ -218,20 +219,27 @@ def get_missing_ids(limit: int) -> List[int]:
 # ----------------------------------------
 # MTGGoldfish throttle detection + backoff
 # ----------------------------------------
-def _looks_like_throttle(resp: requests.Response) -> bool:
+def _looks_like_throttle(resp: requests.Response, expect_html: bool = False) -> bool:
     if resp.status_code in (429, 403, 503):
         return True
     body = (resp.text or "").lower()
-    # Cloudflare/captcha pages
-    if "<html" in body and ("cloudflare" in body or "captcha" in body or "attention required" in body):
+    # Cloudflare challenge pages
+    throttle_markers = (
+        "captcha",
+        "attention required",
+        "just a moment",
+        "performing security verification",
+        "please enable cookies",
+    )
+    if "<html" in body and any(marker in body for marker in throttle_markers):
         return True
     # Deck download endpoint returning an HTML page is usually bad
-    if "<html" in body:
+    if not expect_html and "<html" in body:
         return True
     return False
 
 
-def _get_with_backoff(url: str) -> Optional[requests.Response]:
+def _get_with_backoff(url: str, expect_html: bool = False) -> Optional[requests.Response]:
     """
     GET with retries and exponential backoff on throttle-like responses.
     Honors Retry-After header when present.
@@ -240,10 +248,10 @@ def _get_with_backoff(url: str) -> Optional[requests.Response]:
         try:
             resp = SESSION.get(url, timeout=MTGGOLDFISH_TIMEOUT)
 
-            if resp.status_code == 200 and not _looks_like_throttle(resp):
+            if resp.status_code == 200 and not _looks_like_throttle(resp, expect_html=expect_html):
                 return resp
 
-            if _looks_like_throttle(resp):
+            if _looks_like_throttle(resp, expect_html=expect_html):
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after:
                     wait = float(retry_after)
@@ -280,6 +288,46 @@ def _get_with_backoff(url: str) -> Optional[requests.Response]:
     return None
 
 
+def _section_to_lines(container) -> List[str]:
+    counts: Dict[str, int] = {}
+
+    if not container:
+        return []
+
+    for img in container.select("img[alt]"):
+        name = normalize_card_name(img.get("alt", ""))
+        if not name:
+            continue
+        counts[name] = counts.get(name, 0) + 1
+
+    return [f"{count} {name}" for name, count in counts.items()]
+
+
+def fetch_deck_text_from_visual_page(deck_id: int) -> Optional[str]:
+    """
+    Build a text decklist from the visual page.
+    MTGGoldfish currently blocks /deck/download/* on GitHub Actions, but the
+    visual page still returns the full maindeck and sideboard as card images.
+    """
+    url = f"https://www.mtggoldfish.com/deck/visual/{deck_id}#online"
+    resp = _get_with_backoff(url, expect_html=True)
+    if not resp or resp.status_code != 200:
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    main_lines = _section_to_lines(soup.select_one(".deck-visual-playmat-maindeck"))
+    side_lines = _section_to_lines(soup.select_one(".deck-visual-playmat-sideboard"))
+
+    if not main_lines:
+        return None
+
+    deck_text = "\n".join(main_lines)
+    if side_lines:
+        deck_text += "\n\n" + "\n".join(side_lines)
+
+    return deck_text
+
+
 # ----------------------------------------
 # Fetch raw decklist text from MTGGoldfish (with jitter/backoff)
 # ----------------------------------------
@@ -291,6 +339,10 @@ def fetch_deck_text(deck_id: int) -> Optional[str]:
       - retry with backoff on 429/403/503/HTML pages
       - use a shared session + headers
     """
+    visual_text = fetch_deck_text_from_visual_page(deck_id)
+    if visual_text:
+        return visual_text
+
     endpoints = [
         f"https://www.mtggoldfish.com/deck/download/{deck_id}",
         f"https://www.mtggoldfish.com/deck/arena_download/{deck_id}",
