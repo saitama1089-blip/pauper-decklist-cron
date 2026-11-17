@@ -7,6 +7,16 @@ on:
         description: Validate two live decks without database access
         type: boolean
         default: false
+      max_decks:
+        description: Maximum decks to process (1-100)
+        type: number
+        default: 100
+      continuation:
+        description: Continuation index (0-3; normally automatic)
+        type: number
+        default: 0
+  schedule:
+    - cron: '17 * * * *'
   repository_dispatch:
     types: [league-cron-complete]
   push:
@@ -14,7 +24,13 @@ on:
       - main
     paths:
       - 'sync_decks.py'
+      - 'deck_sync_state.py'
+      - 'scripts/**'
       - '.github/workflows/sync-decks.yml'
+
+permissions:
+  contents: read
+  actions: write
 
 concurrency:
   group: deck-sync-${{ github.repository }}
@@ -24,6 +40,13 @@ jobs:
   sync-decks:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      MAX_DECKS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.max_decks) || '100' }}
+      DECK_SYNC_CONTINUATION: ${{ inputs.continuation || 0 }}
+      DECK_SYNC_STATE_FILE: state/deck-sync.json
+      DECK_SYNC_REPORT_FILE: state/report.json
+      DECK_SYNC_CLASSIFY_COUNTS: 'true'
+      DECK_SYNC_AUDIT_CACHE: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
 
     steps:
       - name: Checkout repository
@@ -39,15 +62,47 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Validate run limits
+        run: |
+          python -c "import os; n=int(os.environ['MAX_DECKS_PER_RUN']); c=int(os.environ['DECK_SYNC_CONTINUATION']); assert 1 <= n <= 100 and 0 <= c <= 3, 'Invalid deck or continuation limit'"
+
+      - name: Restore persistent retry state
+        id: restore
+        if: github.event_name != 'workflow_dispatch' || !inputs.check_only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/restore_sync_state.py
+
       - name: Check live deck fetching without database access
         if: github.event_name == 'workflow_dispatch' && inputs.check_only
         run: python sync_decks.py --check-decks 8027855 8044902
 
       - name: Run deck sync
+        id: sync
         if: github.event_name != 'workflow_dispatch' || !inputs.check_only
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
-          MAX_DECKS_PER_RUN: '25'
         run: |
           python sync_decks.py
+
+      - name: Check upstream freshness
+        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || !inputs.check_only) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/check_sync_health.py
+
+      - name: Preserve retry state
+        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || !inputs.check_only) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: deck-sync-state
+          path: state/deck-sync.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Continue remaining eligible work
+        if: ${{ !cancelled() && steps.sync.outputs.needs_followup == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/dispatch_followup.py

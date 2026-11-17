@@ -10,6 +10,8 @@ on:
   pull_request:
     paths:
       - 'sync_decks.py'
+      - 'deck_sync_state.py'
+      - 'scripts/**'
       - 'requirements.txt'
       - 'tests/**'
       - '.github/workflows/test-sync.yml'
@@ -18,6 +20,8 @@ on:
     branches: [main]
     paths:
       - 'sync_decks.py'
+      - 'deck_sync_state.py'
+      - 'scripts/**'
       - 'requirements.txt'
       - 'tests/**'
       - '.github/workflows/test-sync.yml'

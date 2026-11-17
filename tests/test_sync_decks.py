@@ -16,6 +16,11 @@ with patch.dict(os.environ, {
 
 class DeckSyncTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.object(sync, "SUPABASE_URL", "https://example.invalid"))
+        self.enterContext(patch.object(sync, "SUPABASE_SERVICE_ROLE", "test-only"))
+        self.enterContext(patch.dict(os.environ, {"DECK_SYNC_STATE_FILE": "", "DECK_SYNC_REPORT_FILE": "",
+                                                 "GITHUB_OUTPUT": "", "GITHUB_STEP_SUMMARY": "",
+                                                 "DECK_SYNC_CONTINUATION": "0"}))
         self.get = self.enterContext(patch.object(sync.SESSION, "get"))
         self.post = self.enterContext(patch.object(
             sync.requests, "post", side_effect=AssertionError("Unexpected live database request")
@@ -147,11 +152,11 @@ class DeckSyncTests(unittest.TestCase):
 
     def test_per_run_limit_applies_across_batches(self):
         with patch.object(sync, "MAX_DECKS_PER_RUN", 3), \
-                patch.object(sync, "get_missing_ids", side_effect=[[1, 2], [3]]) as missing, \
+                patch.object(sync, "get_missing_ids", side_effect=[[1, 2, 3, 4], [4]]) as missing, \
                 patch.object(sync, "fetch_deck_text", return_value="4 Island") as fetch, \
                 patch.object(sync, "save_deck_to_supabase", return_value=True) as save:
             self.assertEqual(sync.sync_missing_decks(), 0)
-        self.assertEqual(missing.call_args_list, [call(limit=2), call(limit=1)])
+        self.assertEqual(missing.call_args_list, [call(sync.MAX_BACKLOG_QUERY), call(sync.MAX_BACKLOG_QUERY)])
         self.assertEqual(fetch.call_args_list, [call(1), call(2), call(3)])
         self.assertEqual(save.call_count, 3)
 
@@ -160,14 +165,14 @@ class DeckSyncTests(unittest.TestCase):
                 patch.object(sync, "get_missing_ids", return_value=[1, 2]) as missing, \
                 patch.object(sync, "fetch_deck_text", return_value=None):
             self.assertEqual(sync.sync_missing_decks(), 1)
-        missing.assert_called_once()
+        self.assertEqual(missing.call_count, 2)
 
     def test_failed_deck_is_not_retried_in_later_batch(self):
-        with patch.object(sync, "get_missing_ids", side_effect=[[1, 2], [1, 3], [1]]) as missing, \
+        with patch.object(sync, "get_missing_ids", side_effect=[[1, 2, 3], [1]]) as missing, \
                 patch.object(sync, "fetch_deck_text", side_effect=[None, "4 Island", "4 Island"]) as fetch, \
                 patch.object(sync, "save_deck_to_supabase", return_value=True):
             self.assertEqual(sync.sync_missing_decks(), 1)  # Report partial failures honestly.
-        self.assertEqual(missing.call_count, 3)
+        self.assertEqual(missing.call_count, 2)
         self.assertEqual(fetch.call_args_list, [call(1), call(2), call(3)])
 
     def test_limit_is_enforced_even_if_rpc_returns_too_many_ids(self):
@@ -184,7 +189,7 @@ class DeckSyncTests(unittest.TestCase):
                 patch.object(sync, "save_deck_to_supabase") as save:
             self.assertEqual(sync.sync_missing_decks(), 1)
         save.assert_not_called()
-        self.get.assert_called_once()
+        self.assertEqual(self.get.call_count, 2)
 
     def test_unexpected_content_type_stops_without_fallback(self):
         self.get.return_value = response(200, widget(1), {"Content-Type": "text/html"})
@@ -200,7 +205,7 @@ class DeckSyncTests(unittest.TestCase):
                                  response(204), response(204), response(200, "[]")]
         self.assertEqual(sync.sync_missing_decks(), 0)
         self.assertEqual(self.post.call_count, 4)
-        self.assertEqual(self.post.call_args_list[0].kwargs["json"], {"max_results": 2})
+        self.assertEqual(self.post.call_args_list[0].kwargs["json"], {"max_results": sync.MAX_BACKLOG_QUERY})
         for index, deck_id in enumerate(ids, 1):
             saved = self.post.call_args_list[index]
             self.assertTrue(saved.args[0].endswith("/rest/v1/deck_cache_view"))
