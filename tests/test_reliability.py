@@ -99,6 +99,15 @@ class WorkerReliabilityTests(unittest.TestCase):
         self.assertEqual(sync.sync_missing_decks(), 1)
         self.assertFalse(self.report.call_args.args[0]["needs_followup"])
 
+    def test_accepted_write_must_remove_id_from_missing_queue(self):
+        self.missing.return_value = [1]
+        self.assertEqual(sync.sync_missing_decks(), 1)
+        report = self.report.call_args.args[0]
+        self.assertEqual(report["success"], 0)
+        self.assertEqual(report["failed"], 1)
+        self.assertFalse(report["needs_followup"])
+        self.assertEqual(RetryState(self.path).data["decks"]["1"]["last_error"], "unconfirmed_write")
+
     def test_runtime_budget_stops_before_next_provider_request(self):
         self.enterContext(patch.object(sync, "MAX_RUN_SECONDS", 1))
         self.missing.return_value = [1]

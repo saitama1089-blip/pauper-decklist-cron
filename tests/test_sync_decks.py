@@ -45,7 +45,7 @@ class DeckSyncTests(unittest.TestCase):
 
     def test_block_after_success_still_returns_failure_and_keeps_saved_deck(self):
         self.get.side_effect = [response(200, widget(1)), response(403)]
-        with patch.object(sync, "get_missing_ids", return_value=[1, 2, 3]), \
+        with patch.object(sync, "get_missing_ids", side_effect=[[1, 2, 3], [2, 3]]), \
                 patch.object(sync, "save_deck_to_supabase", return_value=True) as save:
             self.assertEqual(sync.sync_missing_decks(), 1)
         self.assertEqual(self.get.call_count, 2)
@@ -177,7 +177,7 @@ class DeckSyncTests(unittest.TestCase):
 
     def test_limit_is_enforced_even_if_rpc_returns_too_many_ids(self):
         with patch.object(sync, "MAX_DECKS_PER_RUN", 1), \
-                patch.object(sync, "get_missing_ids", return_value=[1, 2, 3]), \
+                patch.object(sync, "get_missing_ids", side_effect=[[1, 2, 3], [2, 3]]), \
                 patch.object(sync, "fetch_deck_text", return_value="60 Island") as fetch, \
                 patch.object(sync, "save_deck_to_supabase", return_value=True):
             self.assertEqual(sync.sync_missing_decks(), 0)

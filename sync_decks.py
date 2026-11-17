@@ -500,7 +500,8 @@ def save_deck_to_supabase(deck_id: int, json_decklist: Dict) -> bool:
 def import_decks_batch(deck_ids: List[int], state=None, deadline=None) -> Dict:
     """Import a batch of deck IDs and return statistics."""
     state = state or RetryState()
-    stats = {"success": 0, "failed": 0, "skipped": 0, "error": "", "budget_exhausted": False}
+    stats = {"success": 0, "failed": 0, "skipped": 0, "error": "", "budget_exhausted": False,
+             "saved_ids": []}
     invalid_streak = write_failure_streak = 0
 
     for i, deck_id in enumerate(deck_ids, 1):
@@ -521,6 +522,7 @@ def import_decks_batch(deck_ids: List[int], state=None, deadline=None) -> Dict:
             if save_deck_to_supabase(deck_id, json_decklist):
                 log(f"Successfully saved deck {deck_id}")
                 stats["success"] += 1
+                stats["saved_ids"].append(deck_id)
                 state.saved(deck_id)
                 write_failure_streak = 0
             else:
@@ -605,13 +607,22 @@ def sync_missing_decks() -> int:
         state.observe(missing)
         report["missing_before"] = len(missing)
         eligible = [deck_id for deck_id in missing if state.ready(deck_id)]
+        saved_ids = []
         if not state.blocked():
             selected = eligible[:MAX_DECKS_PER_RUN] if MAX_DECKS_PER_RUN else eligible
             stats = import_decks_batch(selected, state, started + MAX_RUN_SECONDS)
+            saved_ids = stats.pop("saved_ids")
             report.update(stats)
         else:
             report["error"] = "Sync cooldown active: " + state.data["global_error"]
         after = get_missing_ids(MAX_BACKLOG_QUERY) if missing else []
+        unconfirmed = set(saved_ids).intersection(after)
+        for deck_id in unconfirmed:
+            state.failed(deck_id, "unconfirmed_write", 300)
+            log(f"Deck {deck_id} is still missing after an accepted write; deferring retry", "ERROR")
+        report["success"] -= len(unconfirmed)
+        report["failed"] += len(unconfirmed)
+        progress = bool(set(missing).difference(after))
         state.observe(after)
         ready = [deck_id for deck_id in after if state.ready(deck_id)]
         report.update(missing_after=len(after), eligible_after=len(ready), deferred=len(after) - len(ready))
@@ -628,7 +639,7 @@ def sync_missing_decks() -> int:
             state.data["last_success_at"] = time.time()
         report["status"] = ("blocked" if state.blocked() else "complete" if not after else
                             "deferred" if not ready else "partial")
-        state.data["no_progress_runs"] = state.data["no_progress_runs"] + 1 if ready and not report["success"] else 0
+        state.data["no_progress_runs"] = state.data["no_progress_runs"] + 1 if ready and not progress else 0
         previous_backlog = state.data["last_backlog"]
         state.data["growing_runs"] = state.data["growing_runs"] + 1 if previous_backlog and len(after) > previous_backlog else 0
         state.data["last_backlog"] = len(after)
@@ -638,7 +649,7 @@ def sync_missing_decks() -> int:
         if state.blocked():
             retry_times.append(state.data["global_retry_at"])
         report["next_retry_utc"] = datetime.fromtimestamp(min(retry_times), timezone.utc).isoformat() if retry_times else "none"
-        report["needs_followup"] = bool(report["success"] and ready and not state.blocked() and continuation < 3)
+        report["needs_followup"] = bool(progress and report["success"] and ready and not state.blocked() and continuation < 3)
         if os.environ.get("DECK_SYNC_AUDIT_CACHE") == "true":
             try:
                 report["invalid_cache_rows"] = audit_cached_decks()
