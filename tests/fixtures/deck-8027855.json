@@ -1,0 +1,94 @@
+{
+  "deck_id": 8027855,
+  "json_decklist": {
+    "mainboard": [
+      {
+        "name": "Mountain",
+        "count": 19,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Mountain"
+      },
+      {
+        "name": "Sazacap's Brew",
+        "count": 1,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Sazacap%27s+Brew"
+      },
+      {
+        "name": "Sneaky Snacker",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Sneaky+Snacker"
+      },
+      {
+        "name": "Voldaren Epicure",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Voldaren+Epicure"
+      },
+      {
+        "name": "Fiery Temper",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Fiery+Temper"
+      },
+      {
+        "name": "Lava Dart",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Lava+Dart"
+      },
+      {
+        "name": "Faithless Looting",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Faithless+Looting"
+      },
+      {
+        "name": "Highway Robbery",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Highway+Robbery"
+      },
+      {
+        "name": "Grab the Prize",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Grab+the+Prize"
+      },
+      {
+        "name": "Lightning Bolt",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Lightning+Bolt"
+      },
+      {
+        "name": "Guttersnipe",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Guttersnipe"
+      },
+      {
+        "name": "Fireblast",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Fireblast"
+      }
+    ],
+    "sideboard": [
+      {
+        "name": "Cast into the Fire",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Cast+into+the+Fire"
+      },
+      {
+        "name": "Pyroblast",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Pyroblast"
+      },
+      {
+        "name": "Relic of Progenitus",
+        "count": 3,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Relic+of+Progenitus"
+      },
+      {
+        "name": "Smash to Smithereens",
+        "count": 2,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Smash+to+Smithereens"
+      },
+      {
+        "name": "Red Elemental Blast",
+        "count": 2,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Red+Elemental+Blast"
+      }
+    ]
+  }
+}
