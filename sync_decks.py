@@ -5,8 +5,11 @@ import re
 import unicodedata
 import time
 import random
+import math
+import argparse
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
 
@@ -16,12 +19,6 @@ from bs4 import BeautifulSoup
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE = os.environ.get("SUPABASE_SERVICE_ROLE")
 
-# Validate required environment variables
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE:
-    print("ERROR: Missing required environment variables!")
-    print("Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE")
-    sys.exit(1)
-
 RESULTS_TABLE = "pauper_league_results"
 DECK_CACHE_TABLE = "deck_cache_view"
 
@@ -30,7 +27,7 @@ DECK_CACHE_TABLE = "deck_cache_view"
 RATE_LIMIT_DELAY = float(os.environ.get("RATE_LIMIT_DELAY", "0.0"))
 
 # 0 means "no limit" (process everything)
-MAX_DECKS_PER_RUN = int(os.environ.get("MAX_DECKS_PER_RUN", "0"))
+MAX_DECKS_PER_RUN = int(os.environ.get("MAX_DECKS_PER_RUN", "50"))
 
 # When processing "all", we still do it in batches for safety
 BATCH_FETCH_LIMIT = int(os.environ.get("BATCH_FETCH_LIMIT", "200"))
@@ -38,8 +35,9 @@ BATCH_FETCH_LIMIT = int(os.environ.get("BATCH_FETCH_LIMIT", "200"))
 # MTGGoldfish throttle/backoff tuning (recommended for GitHub Actions)
 MTGGOLDFISH_DELAY_MIN = float(os.environ.get("MTGGOLDFISH_DELAY_MIN", "3.0"))
 MTGGOLDFISH_DELAY_MAX = float(os.environ.get("MTGGOLDFISH_DELAY_MAX", "7.0"))
-MTGGOLDFISH_MAX_RETRIES = int(os.environ.get("MTGGOLDFISH_MAX_RETRIES", "7"))
+MTGGOLDFISH_MAX_RETRIES = max(1, int(os.environ.get("MTGGOLDFISH_MAX_RETRIES", "3")))
 MTGGOLDFISH_TIMEOUT = int(os.environ.get("MTGGOLDFISH_TIMEOUT", "25"))
+MTGGOLDFISH_MAX_BACKOFF = float(os.environ.get("MTGGOLDFISH_MAX_BACKOFF", "30"))
 
 # Shared session (keep-alive + cookies)
 SESSION = requests.Session()
@@ -49,8 +47,9 @@ SESSION.headers.update({
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/plain,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/javascript, application/javascript, */*; q=0.01",
     "Accept-Language": "en-US,en;q=0.9",
+    "X-Requested-With": "XMLHttpRequest",
     "Connection": "keep-alive",
 })
 
@@ -219,8 +218,12 @@ def get_missing_ids(limit: int) -> List[int]:
 # ----------------------------------------
 # MTGGoldfish throttle detection + backoff
 # ----------------------------------------
-def _looks_like_throttle(resp: requests.Response, expect_html: bool = False) -> bool:
-    if resp.status_code in (429, 403, 503):
+class MTGGoldfishUnavailable(RuntimeError):
+    """Stop the entire sync when the upstream is blocked or unavailable."""
+
+
+def _is_challenge(resp: requests.Response) -> bool:
+    if resp.headers.get("cf-mitigated", "").lower() == "challenge":
         return True
     body = (resp.text or "").lower()
     # Cloudflare challenge pages
@@ -233,135 +236,170 @@ def _looks_like_throttle(resp: requests.Response, expect_html: bool = False) -> 
     )
     if "<html" in body and any(marker in body for marker in throttle_markers):
         return True
-    # Deck download endpoint returning an HTML page is usually bad
-    if not expect_html and "<html" in body:
-        return True
     return False
 
 
-def _get_with_backoff(url: str, expect_html: bool = False) -> Optional[requests.Response]:
-    """
-    GET with retries and exponential backoff on throttle-like responses.
-    Honors Retry-After header when present.
-    """
+def _retry_after_seconds(value: Optional[str]) -> Optional[float]:
+    """Accept both HTTP Retry-After formats; ignore malformed values."""
+    if not value:
+        return None
+    try:
+        wait = float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            wait = (retry_at - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, wait) if math.isfinite(wait) else None
+
+
+def _get_with_backoff(url: str) -> Optional[requests.Response]:
+    """Retry temporary failures, aborting the run instead of every deck in turn."""
     for attempt in range(1, MTGGOLDFISH_MAX_RETRIES + 1):
+        retry_after = None
         try:
             resp = SESSION.get(url, timeout=MTGGOLDFISH_TIMEOUT)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            reason = f"network failure ({type(exc).__name__})"
+        else:
+            if _is_challenge(resp):
+                raise MTGGoldfishUnavailable(
+                    f"MTGGoldfish widget returned a Cloudflare/browser challenge (HTTP {resp.status_code}). "
+                    "Stopping the sync; remaining decks will be retried on a later run."
+                )
+            if resp.status_code == 403:
+                raise MTGGoldfishUnavailable(
+                    "MTGGoldfish widget returned HTTP 403 (Forbidden). Stopping the sync; "
+                    "remaining decks will be retried on a later run."
+                )
 
-            if resp.status_code == 200 and not _looks_like_throttle(resp, expect_html=expect_html):
+            if resp.status_code in (404, 410):
+                return None
+
+            if resp.status_code == 200:
                 return resp
 
-            if _looks_like_throttle(resp, expect_html=expect_html):
-                retry_after = resp.headers.get("Retry-After")
-                if retry_after:
-                    wait = float(retry_after)
-                else:
-                    # exponential backoff + jitter (cap at 120s)
-                    wait = min(120.0, (2 ** (attempt - 1)) + random.uniform(1.0, 4.0))
-
-                log(
-                    f"MTGGoldfish throttle detected ({resp.status_code}). "
-                    f"Backing off {wait:.1f}s (attempt {attempt}/{MTGGOLDFISH_MAX_RETRIES})",
-                    "WARNING",
+            if resp.status_code != 429 and resp.status_code < 500:
+                raise MTGGoldfishUnavailable(
+                    f"MTGGoldfish widget returned unexpected HTTP {resp.status_code}; stopping the sync."
                 )
-                time.sleep(wait)
-                continue
 
-            # Other non-200 errors: small backoff
-            wait = min(30.0, attempt * 2.0 + random.uniform(0.5, 2.0))
-            log(
-                f"MTGGoldfish returned {resp.status_code}. Waiting {wait:.1f}s "
-                f"(attempt {attempt}/{MTGGOLDFISH_MAX_RETRIES})",
-                "WARNING",
+            reason = f"widget HTTP {resp.status_code}"
+            retry_after = _retry_after_seconds(resp.headers.get("Retry-After"))
+
+        if attempt == MTGGOLDFISH_MAX_RETRIES:
+            raise MTGGoldfishUnavailable(
+                f"MTGGoldfish still unavailable after {attempt} attempts: {reason}. "
+                "Stopping the sync; remaining decks will be retried on a later run."
             )
-            time.sleep(wait)
 
-        except (requests.Timeout, requests.ConnectionError) as e:
-            wait = min(120.0, (2 ** (attempt - 1)) + random.uniform(1.0, 4.0))
-            log(
-                f"Network issue fetching MTGGoldfish: {e}. Waiting {wait:.1f}s "
-                f"(attempt {attempt}/{MTGGOLDFISH_MAX_RETRIES})",
-                "WARNING",
-            )
-            time.sleep(wait)
+        wait = min(MTGGOLDFISH_MAX_BACKOFF, (2 ** (attempt - 1)) + random.uniform(1.0, 4.0))
+        if retry_after is not None:
+            if retry_after > MTGGOLDFISH_MAX_BACKOFF:
+                raise MTGGoldfishUnavailable(
+                    f"MTGGoldfish requested Retry-After {retry_after:.1f}s, exceeding "
+                    f"the {MTGGOLDFISH_MAX_BACKOFF:.1f}s wait budget. Stopping the sync."
+                )
+            wait = max(wait, retry_after)
 
-    return None
+        log(
+            f"MTGGoldfish {reason}. Retrying in {wait:.1f}s "
+            f"(attempt {attempt}/{MTGGOLDFISH_MAX_RETRIES})",
+            "WARNING",
+        )
+        time.sleep(wait)
 
 
-def _section_to_lines(container) -> List[str]:
-    counts: Dict[str, int] = {}
+def _decode_js_string(value: str) -> str:
+    """Decode a JavaScript string literal's contents as data, without executing it."""
+    escapes = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "0": "\0"}
 
-    if not container:
-        return []
+    def replace(match):
+        token = match.group(1)
+        if token.startswith("u{") and token.endswith("}"):
+            return chr(int(token[2:-1], 16))
+        if token.startswith("u") and len(token) == 5:
+            return chr(int(token[1:], 16))
+        if token.startswith("x") and len(token) == 3:
+            return chr(int(token[1:], 16))
+        if token.startswith(("u", "x")):
+            raise ValueError("Malformed JavaScript character escape")
+        if token in ("\n", "\r", "\r\n"):
+            return ""
+        return escapes.get(token, token)
 
-    for img in container.select("img[alt]"):
-        name = normalize_card_name(img.get("alt", ""))
-        if not name:
+    decoded = re.sub(r"\\(u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|\r\n|[\s\S])", replace, value)
+    # Join escaped UTF-16 surrogate pairs while preserving literal Unicode.
+    return decoded.encode("utf-16", "surrogatepass").decode("utf-16")
+
+
+def parse_widget_deck_text(script: str, deck_id: int) -> str:
+    """Read the public Expand Decks widget and validate its machine-readable list."""
+    widget_ids = set(re.findall(r"widget-deck-placeholder(?:-manual)?\[data-id=['\"](\d+)['\"]\]", script))
+    if widget_ids != {str(deck_id)}:
+        raise ValueError("Widget deck identity is missing or does not match the requested deck")
+
+    match = re.search(
+        r'''elem\.innerHTML\s*=\s*("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*')\s*;''',
+        script,
+    )
+    if not match:
+        raise ValueError("Widget HTML string is missing or its format changed")
+    soup = BeautifulSoup(_decode_js_string(match.group(1)[1:-1]), "html.parser")
+    formats = {field.get("value", "").lower() for field in soup.find_all("input", attrs={"name": "deck_input[format]"})}
+    if formats != {"pauper"}:
+        raise ValueError("Widget does not identify a Pauper deck")
+    sources = {field.get("value", "") for field in soup.find_all("input", attrs={"name": "deck_input[deck]"})}
+    if len(sources) != 1:
+        raise ValueError("Widget deck field is missing or inconsistent")
+
+    main_lines, side_lines = [], []
+    current = main_lines
+    saw_sideboard = False
+    for line in sources.pop().splitlines():
+        line = line.strip()
+        if not line:
             continue
-        counts[name] = counts.get(name, 0) + 1
+        if line.lower() == "sideboard":
+            if saw_sideboard:
+                raise ValueError("Widget contains repeated sideboard markers")
+            saw_sideboard = True
+            current = side_lines
+            continue
+        card = re.fullmatch(r"([1-9]\d*)\s+(.+)", line)
+        if not card or not card.group(2).strip() or "\0" in line:
+            raise ValueError("Widget contains a malformed card quantity or name")
+        current.append(f"{int(card.group(1))} {normalize_card_name(card.group(2))}")
 
-    return [f"{count} {name}" for name, count in counts.items()]
-
-
-def fetch_deck_text_from_visual_page(deck_id: int) -> Optional[str]:
-    """
-    Build a text decklist from the visual page.
-    MTGGoldfish currently blocks /deck/download/* on GitHub Actions, but the
-    visual page still returns the full maindeck and sideboard as card images.
-    """
-    url = f"https://www.mtggoldfish.com/deck/visual/{deck_id}#online"
-    resp = _get_with_backoff(url, expect_html=True)
-    if not resp or resp.status_code != 200:
-        return None
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    main_lines = _section_to_lines(soup.select_one(".deck-visual-playmat-maindeck"))
-    side_lines = _section_to_lines(soup.select_one(".deck-visual-playmat-sideboard"))
-
-    if not main_lines:
-        return None
-
-    deck_text = "\n".join(main_lines)
-    if side_lines:
-        deck_text += "\n\n" + "\n".join(side_lines)
-
-    return deck_text
+    main_count = sum(int(line.split(" ", 1)[0]) for line in main_lines)
+    side_count = sum(int(line.split(" ", 1)[0]) for line in side_lines)
+    if main_count < 60 or side_count > 15:
+        raise ValueError(f"Invalid Pauper deck size: mainboard={main_count}, sideboard={side_count}")
+    return "\n".join(main_lines) + ("\n\n" + "\n".join(side_lines) if side_lines else "")
 
 
 # ----------------------------------------
-# Fetch raw decklist text from MTGGoldfish (with jitter/backoff)
+# Fetch deck text through the public tournament-page widget
 # ----------------------------------------
 def fetch_deck_text(deck_id: int) -> Optional[str]:
-    """
-    Fetch deck text from MTGGoldfish.
-    On GitHub Actions, throttle is common, so we:
-      - jitter sleep BEFORE each deck fetch
-      - retry with backoff on 429/403/503/HTML pages
-      - use a shared session + headers
-    """
-    visual_text = fetch_deck_text_from_visual_page(deck_id)
-    if visual_text:
-        return visual_text
-
-    endpoints = [
-        f"https://www.mtggoldfish.com/deck/download/{deck_id}",
-        f"https://www.mtggoldfish.com/deck/arena_download/{deck_id}",
-    ]
-
-    # polite jitter before each deck to reduce bot-like cadence
+    """Fetch the same widget used by tournament pages' Expand Decks control."""
+    if deck_id <= 0:
+        raise ValueError("Deck IDs must be positive integers")
     sleep_jitter(MTGGOLDFISH_DELAY_MIN, MTGGOLDFISH_DELAY_MAX)
-
-    for url in endpoints:
-        resp = _get_with_backoff(url)
-        if not resp:
-            continue
-
-        if resp.status_code == 200:
-            text = (resp.text or "").strip()
-            if text and "<html" not in text.lower():
-                return text
-
-    return None
+    url = f"https://www.mtggoldfish.com/widgets/deck/js?deckId={deck_id}"
+    resp = _get_with_backoff(url)
+    if resp is None:
+        return None
+    content_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if content_type not in ("text/javascript", "application/javascript"):
+        raise MTGGoldfishUnavailable(
+            f"Widget for deck {deck_id} returned unexpected content type {content_type!r}; stopping the sync."
+        )
+    try:
+        return parse_widget_deck_text(resp.text, deck_id)
+    except ValueError as exc:
+        raise MTGGoldfishUnavailable(f"Invalid widget for deck {deck_id}: {exc}. Stopping the sync.") from exc
 
 
 # --------------------------------------------------------
@@ -411,7 +449,7 @@ def import_decks_batch(deck_ids: List[int]) -> Dict[str, int]:
 
         text = fetch_deck_text(deck_id)
         if not text:
-            log(f"Could not fetch deck {deck_id} (likely throttled or missing)", "WARNING")
+            log(f"Deck {deck_id} is missing at the widget endpoint (HTTP 404/410)", "WARNING")
             stats["failed"] += 1
             continue
 
@@ -436,28 +474,38 @@ def import_decks_batch(deck_ids: List[int]) -> Dict[str, int]:
 
 
 # ----------------------------------------------------
-# Main sync function (process ALL missing decks)
+# Main sync function (bounded batches)
 # ----------------------------------------------------
 def sync_missing_decks() -> int:
     """
     Sync missing decks from results table to cache table.
-    Processes ALL missing decks by looping until none remain.
+    Process batches up to the configured per-run limit.
     """
     try:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE:
+            log("Missing required SUPABASE_URL or SUPABASE_SERVICE_ROLE environment variable", "ERROR")
+            return 1
         log("=" * 60)
         log("DECK SYNC STARTING (JSON MODE)")
+        log(f"Source: public deck widget; per-run limit: {MAX_DECKS_PER_RUN or 'unlimited'}")
         log("=" * 60)
 
         total_stats = {"success": 0, "failed": 0, "skipped": 0}
         batch_num = 0
+        attempted_ids = set()
 
-        # NEW: track if there was any work to do
         saw_missing_any = False
 
         while True:
             batch_num += 1
 
-            limit = MAX_DECKS_PER_RUN if MAX_DECKS_PER_RUN > 0 else BATCH_FETCH_LIMIT
+            limit = BATCH_FETCH_LIMIT
+            if MAX_DECKS_PER_RUN > 0:
+                remaining = MAX_DECKS_PER_RUN - len(attempted_ids)
+                if remaining <= 0:
+                    log(f"Reached the per-run limit of {MAX_DECKS_PER_RUN} decks.")
+                    break
+                limit = min(limit, remaining)
             missing_ids = get_missing_ids(limit=limit)
 
             log("=" * 60)
@@ -469,13 +517,25 @@ def sync_missing_decks() -> int:
                 log("No missing decks to import. Cache is up to date!")
                 break
 
-            # NEW: we found work to do
+            missing_ids = list(dict.fromkeys(
+                deck_id for deck_id in missing_ids if deck_id not in attempted_ids
+            ))
+            if MAX_DECKS_PER_RUN > 0:
+                missing_ids = missing_ids[:remaining]
+            if not missing_ids:
+                log(
+                    "Only previously attempted decks remain in this batch; deferring them to a later run.",
+                    "WARNING",
+                )
+                break
+
             saw_missing_any = True
 
             log("=" * 60)
             log(f"PROCESSING {len(missing_ids)} DECKS (BATCH {batch_num})")
             log("=" * 60)
 
+            attempted_ids.update(missing_ids)
             stats = import_decks_batch(missing_ids)
 
             total_stats["success"] += stats["success"]
@@ -490,11 +550,10 @@ def sync_missing_decks() -> int:
             log(f"Skipped: {stats['skipped']}")
 
             # If we failed all of them, continuing could loop forever (same IDs keep returning)
-            if stats["success"] == 0 and stats["failed"] > 0 and MAX_DECKS_PER_RUN == 0:
+            if stats["success"] == 0 and stats["failed"] > 0:
                 log(
-                    "No successes in this batch while processing ALL decks; stopping to avoid infinite loop. "
-                    "This is usually MTGGoldfish throttling on GitHub Actions. "
-                    "Increase MTGGOLDFISH_DELAY_MIN/MAX or rerun later.",
+                    "No successes in this batch; stopping to avoid repeating the same failed decks. "
+                    "Retry on a later run.",
                     "WARNING",
                 )
                 break
@@ -510,14 +569,14 @@ def sync_missing_decks() -> int:
         log(f"Skipped: {total_stats['skipped']}")
         log("=" * 60)
 
-        # ✅ FIXED EXIT CODES:
-        # - If there was nothing to do => success
-        # - If there was work and at least one success => success
-        # - If there was work but zero successes => failure
+        # Empty queues succeed; incomplete imports remain visible as failures.
         if not saw_missing_any:
             return 0
-        return 0 if total_stats["success"] > 0 else 1
+        return 0 if total_stats["failed"] == 0 and total_stats["success"] > 0 else 1
 
+    except MTGGoldfishUnavailable as e:
+        log(str(e), "ERROR")
+        return 1
     except Exception as e:
         log(f"Fatal error: {e}", "ERROR")
         import traceback
@@ -528,6 +587,28 @@ def sync_missing_decks() -> int:
 # -------------------------------
 # Entry point
 # -------------------------------
+def check_decks(deck_ids: List[int]) -> int:
+    """Live, read-only smoke test; does not query or write Supabase."""
+    try:
+        for deck_id in dict.fromkeys(deck_ids):
+            text = fetch_deck_text(deck_id)
+            if text is None:
+                raise MTGGoldfishUnavailable(f"Deck {deck_id} is missing at the widget endpoint")
+            deck = process_decklist_to_json(text)
+            main_count = sum(card["count"] for card in deck["mainboard"])
+            side_count = sum(card["count"] for card in deck["sideboard"])
+            log(f"Validated deck {deck_id} via widget: mainboard={main_count}, sideboard={side_count}")
+        log("Live checks passed; no Supabase reads or writes performed.")
+        return 0
+    except (MTGGoldfishUnavailable, ValueError) as exc:
+        log(str(exc), "ERROR")
+        return 1
+
+
 if __name__ == "__main__":
-    exit_code = sync_missing_decks()
+    parser = argparse.ArgumentParser(description="Sync missing Pauper decks using MTGGoldfish's public widget")
+    parser.add_argument("--check-decks", type=int, nargs="+", metavar="DECK_ID",
+                        help="Fetch and validate these decks without any Supabase access")
+    args = parser.parse_args()
+    exit_code = check_decks(args.check_decks) if args.check_decks else sync_missing_decks()
     sys.exit(exit_code)

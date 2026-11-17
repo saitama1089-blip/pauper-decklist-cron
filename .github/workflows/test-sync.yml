@@ -1,0 +1,42 @@
+name: Test Deck Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      live_check:
+        description: Validate two live widgets without database access
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - 'sync_decks.py'
+      - 'requirements.txt'
+      - 'tests/**'
+      - '.github/workflows/test-sync.yml'
+      - '.github/workflows/sync-decks.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'sync_decks.py'
+      - 'requirements.txt'
+      - 'tests/**'
+      - '.github/workflows/test-sync.yml'
+      - '.github/workflows/sync-decks.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+      - name: Check live widgets without database access
+        if: github.event_name == 'workflow_dispatch' && inputs.live_check
+        run: python sync_decks.py --check-decks 8027855 8044902

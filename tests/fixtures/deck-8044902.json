@@ -1,0 +1,124 @@
+{
+  "deck_id": 8044902,
+  "json_decklist": {
+    "mainboard": [
+      {
+        "name": "Island",
+        "count": 16,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Island"
+      },
+      {
+        "name": "Cryptic Serpent",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Cryptic+Serpent"
+      },
+      {
+        "name": "Deem Inferior",
+        "count": 2,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Deem+Inferior"
+      },
+      {
+        "name": "Dispel",
+        "count": 2,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Dispel"
+      },
+      {
+        "name": "Force Spike",
+        "count": 3,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Force+Spike"
+      },
+      {
+        "name": "Deep Analysis",
+        "count": 1,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Deep+Analysis"
+      },
+      {
+        "name": "Mental Note",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Mental+Note"
+      },
+      {
+        "name": "Murmuring Mystic",
+        "count": 2,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Murmuring+Mystic"
+      },
+      {
+        "name": "Counterspell",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Counterspell"
+      },
+      {
+        "name": "Sleep of the Dead",
+        "count": 2,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Sleep+of+the+Dead"
+      },
+      {
+        "name": "Brainstorm",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Brainstorm"
+      },
+      {
+        "name": "Tolarian Terror",
+        "count": 2,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Tolarian+Terror"
+      },
+      {
+        "name": "Lorien Revealed",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Lorien+Revealed"
+      },
+      {
+        "name": "Ponder",
+        "count": 3,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Ponder"
+      },
+      {
+        "name": "Thought Scour",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Thought+Scour"
+      },
+      {
+        "name": "Tolarian Terror",
+        "count": 2,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Tolarian+Terror"
+      },
+      {
+        "name": "Artful Dodge",
+        "count": 1,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Artful+Dodge"
+      }
+    ],
+    "sideboard": [
+      {
+        "name": "Annul",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Annul"
+      },
+      {
+        "name": "Envelop",
+        "count": 1,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Envelop"
+      },
+      {
+        "name": "Gut Shot",
+        "count": 3,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Gut+Shot"
+      },
+      {
+        "name": "Hydroblast",
+        "count": 4,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Hydroblast"
+      },
+      {
+        "name": "Blue Elemental Blast",
+        "count": 2,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Blue+Elemental+Blast"
+      },
+      {
+        "name": "Dispel",
+        "count": 1,
+        "scryfall_url": "https://api.scryfall.com/cards/named?format=image&version=normal&fuzzy=Dispel"
+      }
+    ]
+  }
+}

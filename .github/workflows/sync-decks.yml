@@ -2,6 +2,11 @@ name: Sync Missing Decks
 
 on:
   workflow_dispatch:
+    inputs:
+      check_only:
+        description: Validate two live decks without database access
+        type: boolean
+        default: false
   repository_dispatch:
     types: [league-cron-complete]
   push:
@@ -11,9 +16,14 @@ on:
       - 'sync_decks.py'
       - '.github/workflows/sync-decks.yml'
 
+concurrency:
+  group: deck-sync-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   sync-decks:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -29,9 +39,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Check live deck fetching without database access
+        if: github.event_name == 'workflow_dispatch' && inputs.check_only
+        run: python sync_decks.py --check-decks 8027855 8044902
+
       - name: Run deck sync
+        if: github.event_name != 'workflow_dispatch' || !inputs.check_only
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          MAX_DECKS_PER_RUN: '25'
         run: |
           python sync_decks.py
