@@ -7,8 +7,11 @@ import time
 import random
 import math
 import argparse
+import json
+from pathlib import Path
+from deck_sync_state import RetryState
 from typing import List, Dict, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
@@ -27,7 +30,9 @@ DECK_CACHE_TABLE = "deck_cache_view"
 RATE_LIMIT_DELAY = float(os.environ.get("RATE_LIMIT_DELAY", "0.0"))
 
 # 0 means "no limit" (process everything)
-MAX_DECKS_PER_RUN = int(os.environ.get("MAX_DECKS_PER_RUN", "50"))
+MAX_DECKS_PER_RUN = int(os.environ.get("MAX_DECKS_PER_RUN", "100"))
+MAX_RUN_SECONDS = float(os.environ.get("MAX_RUN_SECONDS", "1200"))
+MAX_BACKLOG_QUERY = 1000000
 
 # When processing "all", we still do it in batches for safety
 BATCH_FETCH_LIMIT = int(os.environ.get("BATCH_FETCH_LIMIT", "200"))
@@ -187,32 +192,80 @@ def get_missing_ids(limit: int) -> List[int]:
         "Content-Type": "application/json",
     }
 
-    payload = {"max_results": limit}
-
-    log(f"Fetching up to {limit} missing deck IDs using RPC get_missing_deck_ids...")
-    r = requests.post(url, json=payload, headers=headers, timeout=30)
-
-    if r.status_code != 200:
-        log(f"RPC call failed with status {r.status_code}: {r.text}", "ERROR")
-        raise RuntimeError(f"Failed to fetch missing IDs via RPC: {r.text}")
-
-    result = r.json()
     missing_ids: List[int] = []
-
-    # Handle both possible return shapes:
-    # 1) [{"deck_id": 123}, ...]
-    # 2) [123, 456, ...]
-    if isinstance(result, list) and result:
-        if isinstance(result[0], dict):
-            for row in result:
-                val = row.get("deck_id") or row.get("id")
-                if val is not None:
-                    missing_ids.append(int(val))
-        else:
-            missing_ids = [int(x) for x in result]
-
+    offset = 0
+    while offset < limit:
+        page_size = min(1000, limit - offset)
+        page_headers = {**headers, "Prefer": "count=exact", "Range-Unit": "items",
+                        "Range": f"{offset}-{offset + page_size - 1}"}
+        r = requests.post(url, json={"max_results": limit}, headers=page_headers, timeout=30)
+        if r.status_code not in (200, 206):
+            raise RuntimeError(f"Missing-ID RPC failed with HTTP {r.status_code}")
+        result = r.json()
+        if not isinstance(result, list):
+            raise ValueError("Missing-ID RPC returned an unexpected response")
+        for row in result:
+            value = (row.get("deck_id") or row.get("id")) if isinstance(row, dict) else row
+            if value is not None:
+                missing_ids.append(int(value))
+        total = r.headers.get("Content-Range", "").rsplit("/", 1)[-1]
+        offset += len(result)
+        if total.isdigit():
+            if int(total) >= MAX_BACKLOG_QUERY:
+                raise RuntimeError("Backlog exceeds the metadata safety limit")
+            if offset >= int(total):
+                break
+        elif len(result) < page_size:
+            break
+        if not result:
+            raise RuntimeError("Missing-ID RPC pagination stopped before the advertised count")
+    missing_ids = list(dict.fromkeys(missing_ids))
+    if total.isdigit() and len(missing_ids) != min(limit, int(total)):
+        raise RuntimeError("Missing-ID RPC returned duplicate or incomplete pages")
     log(f"Found {len(missing_ids)} missing deck IDs")
     return missing_ids
+
+
+def classify_missing_decks(deck_ids):
+    """Count league/challenge references and the oldest missing result date."""
+    headers = {"apikey": SUPABASE_SERVICE_ROLE, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE}"}
+    report = {"league_missing": 0, "challenge_missing": 0, "oldest_result_date": "none"}
+    dates = []
+    for label, table, column, date_column in (
+        ("league", RESULTS_TABLE, "id", "event_date"),
+        ("challenge", "challenge_deck_results", "deck_id", "date"),
+    ):
+        found = set()
+        for offset in range(0, len(deck_ids), 200):
+            group = deck_ids[offset:offset + 200]
+            result = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=headers, timeout=30,
+                                  params={"select": f"{column},{date_column}",
+                                          column: "in.(" + ",".join(map(str, group)) + ")"})
+            if result.status_code != 200:
+                raise RuntimeError(f"Backlog classification failed with HTTP {result.status_code}")
+            for row in result.json():
+                found.add(int(row[column]))
+                if row.get(date_column):
+                    dates.append(date.fromisoformat(str(row[date_column])[:10]).isoformat())
+        report[f"{label}_missing"] = len(found)
+    if dates:
+        report["oldest_result_date"] = min(dates)
+    return report
+
+
+def audit_cached_decks():
+    """Flag existing null/empty cache payloads without overwriting them blindly."""
+    headers = {"apikey": SUPABASE_SERVICE_ROLE, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE}",
+               "Prefer": "count=exact"}
+    total = 0
+    for condition in ("is.null", "eq.[]"):
+        result = requests.head(f"{SUPABASE_URL}/rest/v1/{DECK_CACHE_TABLE}", headers=headers, timeout=30,
+                               params={"select": "deck_id", "limit": 1, "json_decklist->>mainboard": condition})
+        count = result.headers.get("Content-Range", "").rsplit("/", 1)[-1]
+        if result.status_code not in (200, 206) or not count.isdigit():
+            raise RuntimeError("Cache audit did not return an exact count")
+        total += int(count)
+    return total
 
 
 # ----------------------------------------
@@ -220,6 +273,10 @@ def get_missing_ids(limit: int) -> List[int]:
 # ----------------------------------------
 class MTGGoldfishUnavailable(RuntimeError):
     """Stop the entire sync when the upstream is blocked or unavailable."""
+
+
+class InvalidDeckWidget(ValueError):
+    """An individual deck did not pass validation."""
 
 
 def _is_challenge(resp: requests.Response) -> bool:
@@ -399,7 +456,7 @@ def fetch_deck_text(deck_id: int) -> Optional[str]:
     try:
         return parse_widget_deck_text(resp.text, deck_id)
     except ValueError as exc:
-        raise MTGGoldfishUnavailable(f"Invalid widget for deck {deck_id}: {exc}. Stopping the sync.") from exc
+        raise InvalidDeckWidget(f"Invalid widget for deck {deck_id}: {exc}") from exc
 
 
 # --------------------------------------------------------
@@ -440,31 +497,54 @@ def save_deck_to_supabase(deck_id: int, json_decklist: Dict) -> bool:
 # ----------------------------------------------------
 # Import decks in batches
 # ----------------------------------------------------
-def import_decks_batch(deck_ids: List[int]) -> Dict[str, int]:
+def import_decks_batch(deck_ids: List[int], state=None, deadline=None) -> Dict:
     """Import a batch of deck IDs and return statistics."""
-    stats = {"success": 0, "failed": 0, "skipped": 0}
+    state = state or RetryState()
+    stats = {"success": 0, "failed": 0, "skipped": 0, "error": "", "budget_exhausted": False,
+             "saved_ids": []}
+    invalid_streak = write_failure_streak = 0
 
     for i, deck_id in enumerate(deck_ids, 1):
         log(f"[{i}/{len(deck_ids)}] Processing deck {deck_id}...")
 
-        text = fetch_deck_text(deck_id)
-        if not text:
-            log(f"Deck {deck_id} is missing at the widget endpoint (HTTP 404/410)", "WARNING")
-            stats["failed"] += 1
-            continue
-
+        if deadline is not None and time.monotonic() >= deadline:
+            stats["budget_exhausted"] = True
+            break
         try:
+            text = fetch_deck_text(deck_id)
+            if text is None:
+                state.failed(deck_id, "missing_404_410", 86400)
+                stats["failed"] += 1
+                log(f"Deck {deck_id} is unavailable; retrying in 24 hours", "WARNING")
+                continue
             json_decklist = process_decklist_to_json(text)
-
+            invalid_streak = 0
             if save_deck_to_supabase(deck_id, json_decklist):
                 log(f"Successfully saved deck {deck_id}")
                 stats["success"] += 1
+                stats["saved_ids"].append(deck_id)
+                state.saved(deck_id)
+                write_failure_streak = 0
             else:
                 stats["failed"] += 1
-
-        except Exception as e:
-            log(f"Error processing deck {deck_id}: {e}", "ERROR")
+                state.failed(deck_id, "database_write", 300)
+                write_failure_streak += 1
+                if write_failure_streak >= 3:
+                    raise MTGGoldfishUnavailable("Three consecutive database writes failed")
+        except InvalidDeckWidget as e:
             stats["failed"] += 1
+            state.failed(deck_id, "invalid_widget", 21600)
+            invalid_streak += 1
+            log(str(e), "ERROR")
+            if invalid_streak >= 3:
+                stats["error"] = "Three consecutive invalid widgets; source markup may have changed"
+                state.pause(stats["error"])
+                break
+        except MTGGoldfishUnavailable as e:
+            stats["error"] = str(e)
+            state.pause(stats["error"])
+            log(stats["error"], "ERROR")
+            break
 
         # Optional extra delay (generally keep this low; MTGGoldfish jitter does the heavy lifting)
         if RATE_LIMIT_DELAY > 0:
@@ -476,112 +556,120 @@ def import_decks_batch(deck_ids: List[int]) -> Dict[str, int]:
 # ----------------------------------------------------
 # Main sync function (bounded batches)
 # ----------------------------------------------------
+def write_run_report(report):
+    """Publish counts, continuation eligibility and health without credentials."""
+    report_path = os.environ.get("DECK_SYNC_REPORT_FILE")
+    if report_path:
+        path = Path(report_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    output = os.environ.get("GITHUB_OUTPUT")
+    if output:
+        with open(output, "a", encoding="utf-8") as stream:
+            stream.write(f"needs_followup={str(report['needs_followup']).lower()}\n")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        rows = [(key.replace("_", " ").title(), report.get(key, "unknown")) for key in
+                ("status", "missing_before", "success", "failed", "missing_after", "eligible_after",
+                 "deferred", "runtime_seconds", "oldest_pending_hours", "trigger", "next_retry_utc")]
+        rows.extend((key.replace("_", " ").title(), report.get(key, "unknown")) for key in
+                    ("league_missing", "challenge_missing", "oldest_result_date", "invalid_cache_rows"))
+        text = "## Deck synchronization\n\n| Metric | Value |\n| --- | --- |\n"
+        text += "".join(f"| {key} | {value} |\n" for key, value in rows)
+        if report.get("error"):
+            text += "\nError: " + str(report["error"]).replace("\n", " ").replace("|", "\\|") + "\n"
+        if report.get("oldest_pending_hours", 0) > 2:
+            text += "\nWarning: missing decks have remained pending for more than two hours.\n"
+        if report.get("no_progress_runs", 0) >= 3 or report.get("growing_runs", 0) >= 3:
+            text += "\nWarning: the backlog is growing or not progressing across repeated runs.\n"
+        if report.get("invalid_cache_rows", 0):
+            text += "\nWarning: existing null/empty cache rows need repair.\n"
+        with open(summary, "a", encoding="utf-8") as stream:
+            stream.write(text)
+    log("SYNC SUMMARY " + json.dumps(report))
+
+
 def sync_missing_decks() -> int:
-    """
-    Sync missing decks from results table to cache table.
-    Process batches up to the configured per-run limit.
-    """
+    started = time.monotonic()
+    state = None
+    report = {"status": "error", "success": 0, "failed": 0, "needs_followup": False,
+              "trigger": os.environ.get("GITHUB_EVENT_NAME", "local")}
     try:
         if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE:
-            log("Missing required SUPABASE_URL or SUPABASE_SERVICE_ROLE environment variable", "ERROR")
-            return 1
-        log("=" * 60)
-        log("DECK SYNC STARTING (JSON MODE)")
-        log(f"Source: public deck widget; per-run limit: {MAX_DECKS_PER_RUN or 'unlimited'}")
-        log("=" * 60)
-
-        total_stats = {"success": 0, "failed": 0, "skipped": 0}
-        batch_num = 0
-        attempted_ids = set()
-
-        saw_missing_any = False
-
-        while True:
-            batch_num += 1
-
-            limit = BATCH_FETCH_LIMIT
-            if MAX_DECKS_PER_RUN > 0:
-                remaining = MAX_DECKS_PER_RUN - len(attempted_ids)
-                if remaining <= 0:
-                    log(f"Reached the per-run limit of {MAX_DECKS_PER_RUN} decks.")
-                    break
-                limit = min(limit, remaining)
-            missing_ids = get_missing_ids(limit=limit)
-
-            log("=" * 60)
-            log(f"BATCH {batch_num} ANALYSIS")
-            log("=" * 60)
-            log(f"Missing in cache (this batch): {len(missing_ids)}")
-
-            if not missing_ids:
-                log("No missing decks to import. Cache is up to date!")
-                break
-
-            missing_ids = list(dict.fromkeys(
-                deck_id for deck_id in missing_ids if deck_id not in attempted_ids
-            ))
-            if MAX_DECKS_PER_RUN > 0:
-                missing_ids = missing_ids[:remaining]
-            if not missing_ids:
-                log(
-                    "Only previously attempted decks remain in this batch; deferring them to a later run.",
-                    "WARNING",
-                )
-                break
-
-            saw_missing_any = True
-
-            log("=" * 60)
-            log(f"PROCESSING {len(missing_ids)} DECKS (BATCH {batch_num})")
-            log("=" * 60)
-
-            attempted_ids.update(missing_ids)
-            stats = import_decks_batch(missing_ids)
-
-            total_stats["success"] += stats["success"]
-            total_stats["failed"] += stats["failed"]
-            total_stats["skipped"] += stats["skipped"]
-
-            log("=" * 60)
-            log(f"BATCH {batch_num} SUMMARY")
-            log("=" * 60)
-            log(f"Imported: {stats['success']}")
-            log(f"Failed: {stats['failed']}")
-            log(f"Skipped: {stats['skipped']}")
-
-            # If we failed all of them, continuing could loop forever (same IDs keep returning)
-            if stats["success"] == 0 and stats["failed"] > 0:
-                log(
-                    "No successes in this batch; stopping to avoid repeating the same failed decks. "
-                    "Retry on a later run.",
-                    "WARNING",
-                )
-                break
-
-            # Be polite between batches (small pause)
-            time.sleep(random.uniform(2.0, 5.0))
-
-        log("=" * 60)
-        log("FINAL SUMMARY (ALL BATCHES)")
-        log("=" * 60)
-        log(f"Successfully imported: {total_stats['success']}")
-        log(f"Failed to import: {total_stats['failed']}")
-        log(f"Skipped: {total_stats['skipped']}")
-        log("=" * 60)
-
-        # Empty queues succeed; incomplete imports remain visible as failures.
-        if not saw_missing_any:
-            return 0
-        return 0 if total_stats["failed"] == 0 and total_stats["success"] > 0 else 1
-
-    except MTGGoldfishUnavailable as e:
-        log(str(e), "ERROR")
+            raise ValueError("Missing required SUPABASE_URL or SUPABASE_SERVICE_ROLE environment variable")
+        if MAX_DECKS_PER_RUN < 0 or MAX_RUN_SECONDS <= 0:
+            raise ValueError("Invalid deck count or runtime limit")
+        continuation = int(os.environ.get("DECK_SYNC_CONTINUATION", "0"))
+        if not 0 <= continuation <= 3:
+            raise ValueError("Continuation index must be between 0 and 3")
+        state = RetryState(os.environ.get("DECK_SYNC_STATE_FILE"))
+        missing = get_missing_ids(MAX_BACKLOG_QUERY)
+        state.observe(missing)
+        report["missing_before"] = len(missing)
+        eligible = [deck_id for deck_id in missing if state.ready(deck_id)]
+        saved_ids = []
+        if not state.blocked():
+            selected = eligible[:MAX_DECKS_PER_RUN] if MAX_DECKS_PER_RUN else eligible
+            stats = import_decks_batch(selected, state, started + MAX_RUN_SECONDS)
+            saved_ids = stats.pop("saved_ids")
+            report.update(stats)
+        else:
+            report["error"] = "Sync cooldown active: " + state.data["global_error"]
+        after = get_missing_ids(MAX_BACKLOG_QUERY) if missing else []
+        unconfirmed = set(saved_ids).intersection(after)
+        for deck_id in unconfirmed:
+            state.failed(deck_id, "unconfirmed_write", 300)
+            log(f"Deck {deck_id} is still missing after an accepted write; deferring retry", "ERROR")
+        report["success"] -= len(unconfirmed)
+        report["failed"] += len(unconfirmed)
+        progress = bool(set(missing).difference(after))
+        state.observe(after)
+        ready = [deck_id for deck_id in after if state.ready(deck_id)]
+        report.update(missing_after=len(after), eligible_after=len(ready), deferred=len(after) - len(ready))
+        if os.environ.get("DECK_SYNC_CLASSIFY_COUNTS") == "true":
+            try:
+                report.update(classify_missing_decks(after))
+            except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+                log(f"Backlog classification unavailable: {type(exc).__name__}", "WARNING")
+                report["classification_error"] = type(exc).__name__
+        report["oldest_pending_hours"] = round(
+            (time.time() - min(state.data["pending_since"].values())) / 3600, 2
+        ) if after else 0
+        if report["success"] or not after:
+            state.data["last_success_at"] = time.time()
+        report["status"] = ("blocked" if state.blocked() else "complete" if not after else
+                            "deferred" if not ready else "partial")
+        state.data["no_progress_runs"] = state.data["no_progress_runs"] + 1 if ready and not progress else 0
+        previous_backlog = state.data["last_backlog"]
+        state.data["growing_runs"] = state.data["growing_runs"] + 1 if previous_backlog and len(after) > previous_backlog else 0
+        state.data["last_backlog"] = len(after)
+        report.update(no_progress_runs=state.data["no_progress_runs"], growing_runs=state.data["growing_runs"])
+        retry_times = [record["next_retry_at"] for record in state.data["decks"].values()
+                       if record["next_retry_at"] > time.time()]
+        if state.blocked():
+            retry_times.append(state.data["global_retry_at"])
+        report["next_retry_utc"] = datetime.fromtimestamp(min(retry_times), timezone.utc).isoformat() if retry_times else "none"
+        report["needs_followup"] = bool(progress and report["success"] and ready and not state.blocked() and continuation < 3)
+        if os.environ.get("DECK_SYNC_AUDIT_CACHE") == "true":
+            try:
+                report["invalid_cache_rows"] = audit_cached_decks()
+                if report["invalid_cache_rows"]:
+                    report["status"] = "needs_cache_repair"
+            except (requests.RequestException, RuntimeError) as exc:
+                report["cache_audit_error"] = type(exc).__name__
+                log("Cache integrity audit could not be completed", "WARNING")
+        return 1 if report["failed"] or report.get("error") or report.get("invalid_cache_rows") else 0
+    except Exception as exc:
+        report["error"] = str(exc)
+        if state is not None:
+            state.pause(str(exc), 900)
+        log(str(exc), "ERROR")
         return 1
-    except Exception as e:
-        log(f"Fatal error: {e}", "ERROR")
-        import traceback
-        log(traceback.format_exc(), "ERROR")
-        return 1
+    finally:
+        report["runtime_seconds"] = round(time.monotonic() - started, 2)
+        if state is not None:
+            state.save()
+        write_run_report(report)
 
 
 # -------------------------------
